@@ -1,4 +1,4 @@
-## Use  
+## Usage  
 ``` bash
 java -jar J2s.jar -a /path/to/androud.jar\
 -l /path/to/lib.jar -l moreLib.jar\
