@@ -17,6 +17,7 @@ public class J2S {
         Path androidJar = null;
         List<Path> libs = new ArrayList<>();
         List<Path> javaFiles = new ArrayList<>();
+        boolean keepDex = false;
 
         int i = 0;
         while (i < args.length) {
@@ -32,6 +33,9 @@ public class J2S {
                 case "-l": case "--lib":
                     if (++i < args.length) libs.add(Paths.get(args[i]).toAbsolutePath());
                     else error("Missing lib jar after " + args[i-1]);
+                    break;
+                case "--dex":
+                    keepDex = true;
                     break;
                 default:
                     Path p = Paths.get(args[i]).toAbsolutePath();
@@ -108,16 +112,24 @@ public class J2S {
             Path dex = dexDir.resolve("classes.dex");
             if (!Files.exists(dex)) error("d8 did not produce classes.dex");
 
-            // ---- baksmali ----
-            Files.createDirectories(out);
-            run("java", "-cp", selfJar,
-                "com.android.tools.smali.baksmali.Main",
-                "d", dex.toString(), "-o", out.toString());
+            if (keepDex) {
+                // ---- only dex, no smali ----
+                Files.createDirectories(out);
+                Path dexOut = out.resolve("classes.dex");
+                Files.copy(dex, dexOut, StandardCopyOption.REPLACE_EXISTING);
+                System.out.println("Dex output: " + dexOut);
+            } else {
+                // ---- baksmali ----
+                Files.createDirectories(out);
+                run("java", "-cp", selfJar,
+                    "com.android.tools.smali.baksmali.Main",
+                    "d", dex.toString(), "-o", out.toString());
 
-            System.out.println("Smali output: " + out);
-            Files.walk(out)
-                    .filter(f -> Files.isRegularFile(f) && f.toString().endsWith(".smali"))
-                    .forEach(f -> System.out.println("  " + outputDir.relativize(f)));
+                System.out.println("Smali output: " + out);
+                Files.walk(out)
+                        .filter(f -> Files.isRegularFile(f) && f.toString().endsWith(".smali"))
+                        .forEach(f -> System.out.println("  " + outputDir.relativize(f)));
+            }
         } finally {
             delete(tmp);
             System.out.println("Cleaned up temp files");
@@ -172,6 +184,7 @@ public class J2S {
         System.err.println("  -o <dir>            Output directory (default: smali_out)");
         System.err.println("  -a, --android-jar   Android framework jar (required if source uses android.* APIs)");
         System.err.println("  -l, --lib <jar>     Additional library jar (repeatable)");
+        System.err.println("  --dex               Dex-only mode: skip smali, output classes.dex only");
         System.err.println();
         System.err.println("Examples:");
         System.err.println("  java -jar J2S.jar Foo.java");
