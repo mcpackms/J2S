@@ -12,19 +12,27 @@ public class J2S {
             error("Cannot determine J2S.jar path. Run with java -jar J2S.jar");
         }
 
+        // ---- 无参数时显示帮助 ----
+        if (args.length == 0) {
+            usage();
+        }
+
         // ---- 解析参数 ----
         Path out = Paths.get("smali_out");
         Path androidJar = null;
         List<Path> libs = new ArrayList<>();
         List<Path> javaFiles = new ArrayList<>();
         boolean keepDex = false;
+        boolean outSpecified = false;
 
         int i = 0;
         while (i < args.length) {
             switch (args[i]) {
                 case "-o":
-                    if (++i < args.length) out = Paths.get(args[i]).toAbsolutePath();
-                    else error("Missing output dir after -o");
+                    if (++i < args.length) {
+                        out = Paths.get(args[i]).toAbsolutePath();
+                        outSpecified = true;
+                    } else error("Missing output dir after -o");
                     break;
                 case "-a": case "--android-jar":
                     if (++i < args.length) androidJar = Paths.get(args[i]).toAbsolutePath();
@@ -44,6 +52,11 @@ public class J2S {
                     else error("Unrecognized file or option: " + args[i]);
             }
             i++;
+        }
+
+        // --dex 模式下默认输出到 dex_out（除非用户通过 -o 指定了输出目录）
+        if (keepDex && !outSpecified) {
+            out = Paths.get("dex_out");
         }
 
         if (javaFiles.isEmpty())
@@ -181,7 +194,7 @@ public class J2S {
         System.err.println("Usage: java -jar J2S.jar [options] <source.java...>");
         System.err.println();
         System.err.println("Options:");
-        System.err.println("  -o <dir>            Output directory (default: smali_out)");
+        System.err.println("  -o <dir>            Output directory (default: smali_out, or dex_out with --dex)");
         System.err.println("  -a, --android-jar   Android framework jar (required if source uses android.* APIs)");
         System.err.println("  -l, --lib <jar>     Additional library jar (repeatable)");
         System.err.println("  --dex               Dex-only mode: skip smali, output classes.dex only");
