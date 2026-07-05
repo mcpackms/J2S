@@ -1,12 +1,20 @@
-# J2S — Java to Smali Converter
+# J2S — Java / Dex to Smali Converter
 
-Converts Java source files to Smali (or DEX) using the Android toolchain (D8 + Baksmali).
+Converts Java source files to Smali (or DEX) using the Android toolchain (D8 + Baksmali). Also supports direct `.dex → .smali` disassembly.
 
 ## Usage
 
 ```bash
-java -jar J2S.jar [options] <source.java...>
+java -jar J2S.jar [options] <source.java... | source.dex...>
 ```
+
+### Modes
+
+| Mode | Command | Pipeline |
+|---|---|---|
+| **Java → Smali** (default) | `J2S.jar Hello.java` | `.java ──javac──▶ .class ──d8──▶ .dex ──baksmali──▶ .smali` |
+| **Java → Dex** | `J2S.jar --dex Hello.java` | `.java ──javac──▶ .class ──d8──▶ .dex` |
+| **Dex → Smali** | `J2S.jar classes.dex` | `.dex ──baksmali──▶ .smali` |
 
 ### Options
 
@@ -14,32 +22,32 @@ java -jar J2S.jar [options] <source.java...>
 |---|---|
 | `-o <dir>` | Output directory (default: `smali_out`) |
 | `-a, --android-jar <jar>` | Android framework jar (required if source uses `android.*` APIs) |
-| `-l, --lib <jar>` | Additional library jar (repeatable) |
-| `--dex` | Dex-only mode: skip smali disassembly, output `classes.dex` only |
+| `-l, --lib <jar>` | Additional library jar (repeatable, Java mode only) |
+| `--dex` | Dex-only output in Java mode (skip smali) |
 
 ### Examples
 
 ```bash
-# Basic: compile Java to Smali
+# Java → Smali
 java -jar J2S.jar Hello.java
 
-# With android.jar and output dir
+# Java → Smali with android.jar
 java -jar J2S.jar -a android.jar -o output Hello.java
 
-# Multiple source files and library jars
+# Java → Smali with multiple sources and libs
 java -jar J2S.jar -a android.jar -l support-lib.jar -o out *.java
 
-# Dex-only mode (no smali)
-java -jar J2S.jar --dex -o out Hello.java
-```
+# Java → Dex only
+java -jar J2S.jar --dex Hello.java
 
-## Pipeline
+# Dex → Smali
+java -jar J2S.jar classes.dex
 
-```
-.java  ──javac──▶  .class  ──d8──▶  .dex  ──baksmali──▶  .smali
-                   (temp)         (temp)      │           (output)
-                                              │
-                                   (--dex)    └──▶ classes.dex (output)
+# Dex → Smali with custom output dir
+java -jar J2S.jar -o smali_out classes.dex
+
+# Multiple dex files
+java -jar J2S.jar classes.dex classes2.dex
 ```
 
 ## Build
