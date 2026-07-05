@@ -17,9 +17,10 @@
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <main.class>J2S</main.class>
+        <main.class>com.j2s.J2S</main.class>
         <baksmali.version>3.0.7</baksmali.version>
         <r8.version>8.3.37</r8.version>
+        <dex2jar.version>2.4.28</dex2jar.version>
     </properties>
 
     <dependencies>
@@ -35,6 +36,13 @@
             <groupId>com.android.tools</groupId>
             <artifactId>r8</artifactId>
             <version>${r8.version}</version>
+        </dependency>
+
+        <!-- dex2jar: DEX → JAR -->
+        <dependency>
+            <groupId>de.femtopedia.dex2jar</groupId>
+            <artifactId>dex2jar</artifactId>
+            <version>${dex2jar.version}</version>
         </dependency>
     </dependencies>
 
