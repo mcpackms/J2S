@@ -10,6 +10,10 @@ import java.util.stream.*;
  *
  * <p>With {@code --keep-dex} the baksmali step is skipped and the raw
  * {@code classes.dex} is copied to the output directory instead.
+ *
+ * <p>The d8 + baksmali half is exposed as {@link #compileClassesToDex} so
+ * the Kotlin pipeline (K2S) can reuse it after {@code kotlinc} produces
+ * its own {@code .class} files.
  */
 public class JavaPipeline {
 
@@ -18,7 +22,6 @@ public class JavaPipeline {
                            String selfJar) throws Exception {
         Path tmp = Files.createTempDirectory("j2s_");
         System.out.println("Temp dir: " + tmp);
-        final Path outputDir = out;
 
         try {
             // ── javac ──
@@ -50,9 +53,45 @@ public class JavaPipeline {
             if (classes.isEmpty()) Utils.error("No .class files generated");
             System.out.println("Compiled " + classes.size() + " classes");
 
-            // ── d8 ──
-            Path dexDir = tmp.resolve("dex");
+            // ── d8 + (optional) baksmali ──
+            compileClassesToDex(classes, out, androidJar, libs, minApi, keepDex, selfJar);
+
+        } finally {
+            Utils.delete(tmp);
+            System.out.println("Cleaned up temp files");
+        }
+    }
+
+    /**
+     * Shared backend: given already-compiled {@code .class} files, run d8 to
+     * produce {@code classes.dex}, then (unless {@code keepDex} is true) run
+     * baksmali to produce {@code .smali}.
+     *
+     * <p>Called by:
+     * <ul>
+     *   <li>{@link #run} — after javac</li>
+     *   <li>{@code KotlinPipeline.run} — after kotlinc (K2S)</li>
+     * </ul>
+     *
+     * <p>The caller is responsible for the temporary directory that holds
+     * the {@code .class} files; this method does not delete them.
+     */
+    public static void compileClassesToDex(List<Path> classes,
+                                           Path out,
+                                           Path androidJar,
+                                           List<Path> libs,
+                                           int minApi,
+                                           boolean keepDex,
+                                           String selfJar) throws Exception {
+        if (classes.isEmpty()) Utils.error("No .class files to convert");
+
+        // Temp dir only for the intermediate dex output of d8.
+        Path dexWork = Files.createTempDirectory("j2s_dex_");
+        try {
+            Path dexDir = dexWork.resolve("dex");
             Files.createDirectory(dexDir);
+
+            // ── d8 ──
             List<String> d8cmd = new ArrayList<>();
             d8cmd.add("java");
             d8cmd.add("-cp");
@@ -86,17 +125,17 @@ public class JavaPipeline {
                 // ── baksmali ──
                 Files.createDirectories(out);
                 Utils.run("java", "-cp", selfJar,
-                    "com.android.tools.smali.baksmali.Main",
-                    "d", dex.toString(), "-o", out.toString());
+                        "com.android.tools.smali.baksmali.Main",
+                        "d", dex.toString(), "-o", out.toString());
 
                 System.out.println("Smali output: " + out);
+                final Path outputDir = out;
                 Files.walk(out)
                         .filter(f -> Files.isRegularFile(f) && f.toString().endsWith(".smali"))
                         .forEach(f -> System.out.println("  " + outputDir.relativize(f)));
             }
         } finally {
-            Utils.delete(tmp);
-            System.out.println("Cleaned up temp files");
+            Utils.delete(dexWork);
         }
     }
 }
