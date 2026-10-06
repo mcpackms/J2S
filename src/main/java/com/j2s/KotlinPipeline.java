@@ -79,7 +79,7 @@ public final class KotlinPipeline {
     }
 
     /** Locate kotlinc: explicit --kotlin-home > PATH. */
-    private static Path resolveKotlinc(String kotlinHome) {
+    static Path resolveKotlinc(String kotlinHome) {
         // 1. explicit override
         if (kotlinHome != null) {
             Path p = Paths.get(kotlinHome, "bin", "kotlinc");
@@ -103,7 +103,7 @@ public final class KotlinPipeline {
         return null;
     }
 
-    private static void deleteRecursive(Path p) {
+    static void deleteRecursive(Path p) {
         try {
             if (!Files.exists(p)) return;
             Files.walk(p)

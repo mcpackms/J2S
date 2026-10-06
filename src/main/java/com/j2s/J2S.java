@@ -6,18 +6,18 @@ import java.util.*;
 /**
  * J2S — Convert between Java/Kotlin source, DEX, and JAR formats.
  *
- * <p>Four input modes, auto-detected by file extension:
+ * <p>Input modes, auto-detected by file extension:
  * <ul>
- *   <li>{@code .java} → Java compilation pipeline
- *   <li>{@code .kt}   → Kotlin compilation pipeline (K2S)
- *   <li>{@code .dex}  → Dex disassembly or dex2jar
- *   <li>{@code .jar}  → D8 compression to dex jar
+ *   <li>{@code .java}          → Java compilation pipeline
+ *   <li>{@code .kt} / {@code .kts} → Kotlin compilation pipeline (K2S)
+ *   <li>{@code .java} + {@code .kt} → Mixed Java + Kotlin pipeline
+ *   <li>{@code .dex}           → Dex disassembly or dex2jar
+ *   <li>{@code .jar}           → D8 compression to dex jar
  * </ul>
  */
 public class J2S {
 
     public static void main(String[] args) throws Exception {
-        // ── Locate the JAR (child processes need it for bundled deps) ──
         String selfJar = Utils.getJarPath();
         if (selfJar == null) {
             Utils.error("Cannot determine J2S.jar path. Run with java -jar J2S.jar");
@@ -92,36 +92,44 @@ public class J2S {
         if (inputFiles.isEmpty())
             Utils.error("At least one .java, .kt, .dex, or .jar file is required");
 
-        // ── Detect mode from input file extensions ──
-        boolean javaMode   = inputFiles.stream().allMatch(f -> {
-            String n = f.toString().toLowerCase();
-            return n.endsWith(".java");
-        });
-        boolean kotlinMode = inputFiles.stream().allMatch(f -> {
+        // ── Detect input kind from file extensions ──
+        boolean hasJava   = inputFiles.stream()
+                .anyMatch(f -> f.toString().toLowerCase().endsWith(".java"));
+        boolean hasKotlin = inputFiles.stream().anyMatch(f -> {
             String n = f.toString().toLowerCase();
             return n.endsWith(".kt") || n.endsWith(".kts");
         });
-        boolean dexMode    = inputFiles.stream().allMatch(f -> f.toString().toLowerCase().endsWith(".dex"));
-        boolean jarMode    = inputFiles.stream().allMatch(f -> f.toString().toLowerCase().endsWith(".jar"));
+        boolean hasDex    = inputFiles.stream()
+                .anyMatch(f -> f.toString().toLowerCase().endsWith(".dex"));
+        boolean hasJar    = inputFiles.stream()
+                .anyMatch(f -> f.toString().toLowerCase().endsWith(".jar"));
 
-        if (!javaMode && !kotlinMode && !dexMode && !jarMode)
-            Utils.error("Mixed file types are not allowed");
+        int kindCount = ((hasJava || hasKotlin) ? 1 : 0)
+                      + (hasDex ? 1 : 0)
+                      + (hasJar ? 1 : 0);
+        if (kindCount > 1)
+            Utils.error("Cannot mix source (.java/.kt), .dex, and .jar inputs");
+
+        boolean sourceMode = hasJava || hasKotlin;
+        boolean javaOnly   = hasJava && !hasKotlin;
+        boolean kotlinOnly = hasKotlin && !hasJava;
+        boolean mixedMode  = hasJava && hasKotlin;
 
         // ── Validate flag vs mode consistency ──
-        if (keepDex && !(javaMode || kotlinMode))
+        if (keepDex && !sourceMode)
             Utils.error("--keep-dex only applies to .java / .kt input");
-        if (makeJar && !dexMode)
+        if (makeJar && !hasDex)
             Utils.error("--jar only applies to .dex input");
         if (keepDex && makeJar)
             Utils.error("--keep-dex and --jar are mutually exclusive");
 
         // ── Infer default output path when -o is omitted ──
-        if (jarMode && !outSpecified) {
+        if (hasJar && !outSpecified) {
             String name = inputFiles.get(0).getFileName().toString();
             out = inputFiles.get(0).resolveSibling(name.replaceAll("\\.jar$", ".dex.jar"));
-        } else if (keepDex && (javaMode || kotlinMode) && !outSpecified) {
+        } else if (keepDex && sourceMode && !outSpecified) {
             out = Paths.get("dex_out");
-        } else if (makeJar && dexMode && !outSpecified) {
+        } else if (makeJar && hasDex && !outSpecified) {
             String name = inputFiles.get(0).getFileName().toString();
             out = inputFiles.get(0).resolveSibling(name.replaceAll("\\.dex$", ".jar"));
         }
@@ -132,16 +140,15 @@ public class J2S {
         for (Path lib : libs)
             if (!Files.exists(lib)) Utils.error(lib + " does not exist");
 
-        // ── Dispatch to the appropriate converter ──
-        if (jarMode) {
+        // ── Dispatch ──
+        if (hasJar) {
             JarDex.run(inputFiles, out, androidJar, libs, minApi, selfJar);
-        } else if (dexMode) {
-            if (makeJar) {
-                DexJar.run(inputFiles, out);
-            } else {
-                DexSmali.run(inputFiles, out, selfJar);
-            }
-        } else if (kotlinMode) {
+        } else if (hasDex) {
+            if (makeJar) DexJar.run(inputFiles, out);
+            else         DexSmali.run(inputFiles, out, selfJar);
+        } else if (mixedMode) {
+            MixedPipeline.run(inputFiles, out, androidJar, libs, minApi, keepDex, selfJar, kotlinHome);
+        } else if (kotlinOnly) {
             KotlinPipeline.run(inputFiles, out, androidJar, libs, minApi, keepDex, selfJar, kotlinHome);
         } else {
             JavaPipeline.run(inputFiles, out, androidJar, libs, minApi, keepDex, selfJar);
@@ -152,30 +159,33 @@ public class J2S {
         System.err.println("Usage: java -jar J2S.jar [options] <src.java... | src.kt... | src.dex... | src.jar...>");
         System.err.println();
         System.err.println("Modes (detected by input file extension):");
-        System.err.println("  Java mode (.java)    Compile .java -> .class -> .dex -> .smali");
-        System.err.println("    --keep-dex         Skip smali, output .dex only");
-        System.err.println("  Kotlin mode (.kt)    Compile .kt -> .class -> .dex -> .smali   (K2S)");
-        System.err.println("    --keep-dex         Skip smali, output .dex only");
-        System.err.println("    --kotlin-home <p>  Override kotlinc location (default: PATH)");
-        System.err.println("  Dex mode (.dex)      Disassemble .dex -> .smali");
-        System.err.println("    --jar              Convert .dex -> .jar (dex2jar)");
-        System.err.println("  Jar mode (.jar)      Compress .jar -> .dex.jar (D8)");
+        System.err.println("  Java mode (.java)        Compile .java -> .class -> .dex -> .smali");
+        System.err.println("    --keep-dex             Skip smali, output .dex only");
+        System.err.println("  Kotlin mode (.kt)        Compile .kt -> .class -> .dex -> .smali   (K2S)");
+        System.err.println("    --keep-dex             Skip smali, output .dex only");
+        System.err.println("    --kotlin-home <p>      Override kotlinc location (default: PATH)");
+        System.err.println("  Mixed mode (.java+.kt)   Compile together -> .class -> .dex -> .smali");
+        System.err.println("    --keep-dex             Skip smali, output .dex only");
+        System.err.println("  Dex mode (.dex)          Disassemble .dex -> .smali");
+        System.err.println("    --jar                  Convert .dex -> .jar (dex2jar)");
+        System.err.println("  Jar mode (.jar)          Compress .jar -> .dex.jar (D8)");
         System.err.println();
         System.err.println("Options:");
         System.err.println("  -o <path>            Output path (default depends on mode)");
         System.err.println("  -a, --android-jar    Android framework jar");
         System.err.println("  -l, --lib <jar>      Additional library jar (repeatable)");
         System.err.println("  --min-api <N>        Minimum API level for D8 (default: 21)");
-        System.err.println("  --keep-dex           Java/Kotlin mode: output .dex only");
+        System.err.println("  --keep-dex           Source mode: output .dex only");
         System.err.println("  --jar                Dex mode: output .jar instead of .smali");
-        System.err.println("  --kotlin-home <path> Kotlin mode: path to kotlinc home (default: use PATH)");
+        System.err.println("  --kotlin-home <path> Kotlin/mixed mode: path to kotlinc home (default: PATH)");
         System.err.println();
         System.err.println("Examples:");
         System.err.println("  java -jar J2S.jar Hello.java");
         System.err.println("  java -jar J2S.jar --keep-dex Hello.java");
         System.err.println("  java -jar J2S.jar Hello.kt                          # kotlinc from PATH");
         System.err.println("  java -jar J2S.jar --keep-dex Hello.kt");
-        System.err.println("  java -jar J2S.jar --kotlin-home /opt/kotlinc -a android.jar *.kt");
+        System.err.println("  java -jar J2S.jar Main.kt Util.java                 # mixed Java + Kotlin");
+        System.err.println("  java -jar J2S.jar -a android.jar --kotlin-home /opt/kotlinc *.kt");
         System.err.println("  java -jar J2S.jar classes.dex              # dex -> smali");
         System.err.println("  java -jar J2S.jar --jar classes.dex        # dex -> jar");
         System.err.println("  java -jar J2S.jar app.jar                  # jar -> dex");

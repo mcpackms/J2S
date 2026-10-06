@@ -19,7 +19,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <main.class>com.j2s.J2S</main.class>
         <baksmali.version>3.0.7</baksmali.version>
-        <r8.version>8.3.37</r8.version>
+        <r8.version>9.1.31</r8.version>
         <dex2jar.version>2.4.28</dex2jar.version>
     </properties>
 

@@ -44,6 +44,7 @@ public class JavaPipeline {
             javacArgs.add("1.8");
             javacArgs.add("-target");
             javacArgs.add("1.8");
+            javacArgs.add("-Xlint:-options");
             inputFiles.forEach(f -> javacArgs.add(f.toString()));
             Utils.run(javacArgs.toArray(new String[0]));
 
