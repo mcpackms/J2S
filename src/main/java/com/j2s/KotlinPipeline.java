@@ -42,8 +42,6 @@ public final class KotlinPipeline {
             ktCmd.add(kotlinc.toString());
             ktCmd.add("-d");
             ktCmd.add(classesDir.toString());
-            ktCmd.add("-no-stdlib");   // users must supply kotlin-stdlib via -l
-            ktCmd.add("-no-reflect");
             ktCmd.add("-jvm-target");
             ktCmd.add("1.8");
 
