@@ -19,6 +19,8 @@ import java.util.stream.*;
  * kotlinc is given the .java files too so Kotlin code can reference Java
  * symbols (and vice-versa) in a single pass. javac then compiles the .java
  * files that kotlinc did not emit classes for.
+ *
+ * <p>kotlin-stdlib is auto-located near kotlinc and merged into the dex.
  */
 public final class MixedPipeline {
 
@@ -101,7 +103,7 @@ public final class MixedPipeline {
                 Utils.run(javacArgs.toArray(new String[0]));
             }
 
-            // ── 3. Collect every .class and run d8 + baksmali ──
+            // ── 3. Collect every .class ──
             List<Path> classFiles;
             try (Stream<Path> s = Files.walk(classesDir)) {
                 classFiles = s.filter(p -> p.toString().endsWith(".class"))
@@ -110,7 +112,20 @@ public final class MixedPipeline {
             if (classFiles.isEmpty()) Utils.error("No .class files produced");
             System.out.println("Compiled " + classFiles.size() + " classes total");
 
-            JavaPipeline.compileClassesToDex(classFiles, out, androidJar, libs, minApi, keepDex, selfJar);
+            // ── 4. Locate kotlin-stdlib and merge into the dex ──
+            List<Path> stdlibJars = KotlinPipeline.resolveKotlinStdlib(kotlinc);
+            if (stdlibJars.isEmpty()) {
+                System.out.println("Warning: kotlin-stdlib not found near kotlinc; "
+                                 + "runtime may fail with NoClassDefFoundError. "
+                                 + "Pass -l <kotlin-stdlib.jar> to include it explicitly.");
+            } else {
+                System.out.println("Merging kotlin-stdlib (" + stdlibJars.size() + " jar(s)):");
+                for (Path j : stdlibJars) System.out.println("  " + j);
+            }
+
+            JavaPipeline.compileClassesToDex(
+                    classFiles, out, androidJar, libs, minApi, keepDex, selfJar,
+                    stdlibJars);
 
         } finally {
             KotlinPipeline.deleteRecursive(work);

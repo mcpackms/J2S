@@ -12,6 +12,10 @@ import java.util.stream.*;
  * kotlinc is located as follows:
  *   1. {@code --kotlin-home <dir>}  ->  {@code <dir>/bin/kotlinc[.bat]}
  *   2. Otherwise, look up {@code kotlinc} / {@code kotlinc.bat} on the system PATH.
+ *
+ * <p>kotlinc's bundled kotlin-stdlib.jar is automatically located and merged
+ * into the output dex, so the runtime no longer crashes with
+ * {@code NoClassDefFoundError: kotlin/jvm/internal/Intrinsics}.
  */
 public final class KotlinPipeline {
 
@@ -45,7 +49,8 @@ public final class KotlinPipeline {
             ktCmd.add("-jvm-target");
             ktCmd.add("1.8");
 
-            // Classpath: android.jar + user libs (should include kotlin-stdlib.jar)
+            // Classpath: android.jar + user libs
+            // kotlinc 自己会加载 stdlib，无需在 -classpath 里重复指定
             List<String> cp = new ArrayList<>();
             if (androidJar != null) cp.add(androidJar.toString());
             for (Path lib : libs)   cp.add(lib.toString());
@@ -59,7 +64,7 @@ public final class KotlinPipeline {
             System.out.println("kotlinc " + ktFiles.size() + " file(s) ...");
             Utils.run(ktCmd.toArray(new String[0]));
 
-            // ── 2. Hand off .class tree to the shared Java backend ──
+            // ── 2. Collect .class files ──
             List<Path> classFiles;
             try (Stream<Path> s = Files.walk(classesDir)) {
                 classFiles = s.filter(p -> p.toString().endsWith(".class"))
@@ -70,7 +75,20 @@ public final class KotlinPipeline {
             }
             System.out.println("Compiled " + classFiles.size() + " classes");
 
-            JavaPipeline.compileClassesToDex(classFiles, out, androidJar, libs, minApi, keepDex, selfJar);
+            // ── 3. Locate & merge kotlin-stdlib into the dex ──
+            List<Path> stdlibJars = resolveKotlinStdlib(kotlinc);
+            if (stdlibJars.isEmpty()) {
+                System.out.println("Warning: kotlin-stdlib not found near kotlinc; "
+                                 + "runtime may fail with NoClassDefFoundError. "
+                                 + "Pass -l <kotlin-stdlib.jar> to include it explicitly.");
+            } else {
+                System.out.println("Merging kotlin-stdlib (" + stdlibJars.size() + " jar(s)):");
+                for (Path j : stdlibJars) System.out.println("  " + j);
+            }
+
+            JavaPipeline.compileClassesToDex(
+                    classFiles, out, androidJar, libs, minApi, keepDex, selfJar,
+                    stdlibJars);
 
         } finally {
             deleteRecursive(work);
@@ -101,6 +119,63 @@ public final class KotlinPipeline {
             }
         }
         return null;
+    }
+
+    /**
+     * Locate kotlinc's bundled kotlin-stdlib jars (stdlib + jdk7 + jdk8).
+     *
+     * <p>Search order:
+     * <ol>
+     *   <li>The real path of {@code kotlinc} (resolving symlinks) → {@code <home>/lib}</li>
+     *   <li>{@code $KOTLIN_HOME/lib}</li>
+     * </ol>
+     *
+     * <p>Returns an empty list if nothing is found; caller should not treat
+     * that as a hard error (user may supply stdlib via {@code -l}).
+     */
+    static List<Path> resolveKotlinStdlib(Path kotlinc) {
+        if (kotlinc == null) return Collections.emptyList();
+
+        List<Path> homes = new ArrayList<>();
+
+        // 1. Resolve symlinks to find the real kotlinc location
+        Path real = kotlinc;
+        try { real = kotlinc.toRealPath(); } catch (IOException ignored) {}
+        Path bin = real.getParent();
+        if (bin != null) {
+            Path home = bin.getParent();
+            if (home != null) homes.add(home);
+        }
+
+        // 2. KOTLIN_HOME environment variable
+        String env = System.getenv("KOTLIN_HOME");
+        if (env != null && !env.isEmpty()) {
+            homes.add(Paths.get(env));
+        }
+
+        // 3. Sibling to the raw kotlinc path (in case of wrapper scripts)
+        Path rawBin = kotlinc.getParent();
+        if (rawBin != null) {
+            Path rawHome = rawBin.getParent();
+            if (rawHome != null) homes.add(rawHome);
+        }
+
+        for (Path home : homes) {
+            Path lib = home.resolve("lib");
+            if (!Files.isDirectory(lib)) continue;
+
+            List<Path> found = new ArrayList<>();
+            for (String name : new String[] {
+                    "kotlin-stdlib.jar",
+                    "kotlin-stdlib-jdk7.jar",
+                    "kotlin-stdlib-jdk8.jar" }) {
+                Path p = lib.resolve(name);
+                if (Files.isRegularFile(p)) found.add(p);
+            }
+            if (!found.isEmpty()) return found;
+        }
+
+        return Collections.emptyList();
     }
 
     static void deleteRecursive(Path p) {

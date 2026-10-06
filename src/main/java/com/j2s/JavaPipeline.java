@@ -12,8 +12,8 @@ import java.util.stream.*;
  * {@code classes.dex} is copied to the output directory instead.
  *
  * <p>The d8 + baksmali half is exposed as {@link #compileClassesToDex} so
- * the Kotlin pipeline (K2S) can reuse it after {@code kotlinc} produces
- * its own {@code .class} files.
+ * the Kotlin and mixed pipelines can reuse it after producing their own
+ * {@code .class} files.
  */
 public class JavaPipeline {
 
@@ -24,7 +24,6 @@ public class JavaPipeline {
         System.out.println("Temp dir: " + tmp);
 
         try {
-            // ── javac ──
             List<String> javacArgs = new ArrayList<>();
             javacArgs.add("javac");
             javacArgs.add("-d");
@@ -54,7 +53,6 @@ public class JavaPipeline {
             if (classes.isEmpty()) Utils.error("No .class files generated");
             System.out.println("Compiled " + classes.size() + " classes");
 
-            // ── d8 + (optional) baksmali ──
             compileClassesToDex(classes, out, androidJar, libs, minApi, keepDex, selfJar);
 
         } finally {
@@ -64,18 +62,7 @@ public class JavaPipeline {
     }
 
     /**
-     * Shared backend: given already-compiled {@code .class} files, run d8 to
-     * produce {@code classes.dex}, then (unless {@code keepDex} is true) run
-     * baksmali to produce {@code .smali}.
-     *
-     * <p>Called by:
-     * <ul>
-     *   <li>{@link #run} — after javac</li>
-     *   <li>{@code KotlinPipeline.run} — after kotlinc (K2S)</li>
-     * </ul>
-     *
-     * <p>The caller is responsible for the temporary directory that holds
-     * the {@code .class} files; this method does not delete them.
+     * Backwards-compatible entry: no extra jars to merge.
      */
     public static void compileClassesToDex(List<Path> classes,
                                            Path out,
@@ -84,15 +71,38 @@ public class JavaPipeline {
                                            int minApi,
                                            boolean keepDex,
                                            String selfJar) throws Exception {
+        compileClassesToDex(classes, out, androidJar, libs, minApi, keepDex, selfJar,
+                            Collections.<Path>emptyList());
+    }
+
+    /**
+     * Shared backend: given already-compiled {@code .class} files, run d8 to
+     * produce {@code classes.dex}, then (unless {@code keepDex} is true) run
+     * baksmali to produce {@code .smali}.
+     *
+     * <p>Called by {@link #run}, {@code KotlinPipeline.run}, and
+     * {@code MixedPipeline.run}.
+     *
+     * @param mergeJars 额外要作为 d8 <b>输入</b>（编进 dex）的 jar，
+     *                   例如 kotlin-stdlib.jar。这些 jar 的类会出现在
+     *                   最终 dex 中。与 {@code libs} 不同，{@code libs}
+     *                   只作为 {@code --lib} 参考库，不会编进 dex。
+     */
+    public static void compileClassesToDex(List<Path> classes,
+                                           Path out,
+                                           Path androidJar,
+                                           List<Path> libs,
+                                           int minApi,
+                                           boolean keepDex,
+                                           String selfJar,
+                                           List<Path> mergeJars) throws Exception {
         if (classes.isEmpty()) Utils.error("No .class files to convert");
 
-        // Temp dir only for the intermediate dex output of d8.
         Path dexWork = Files.createTempDirectory("j2s_dex_");
         try {
             Path dexDir = dexWork.resolve("dex");
             Files.createDirectory(dexDir);
 
-            // ── d8 ──
             List<String> d8cmd = new ArrayList<>();
             d8cmd.add("java");
             d8cmd.add("-cp");
@@ -110,20 +120,28 @@ public class JavaPipeline {
             d8cmd.add(String.valueOf(minApi));
             d8cmd.add("--output");
             d8cmd.add(dexDir.toString());
+
+            // .class 文件作为输入
             classes.forEach(c -> d8cmd.add(c.toString()));
+
+            // 额外要合并进 dex 的 jar（例如 kotlin-stdlib）
+            for (Path jar : mergeJars) {
+                if (jar != null && Files.isRegularFile(jar)) {
+                    d8cmd.add(jar.toString());
+                }
+            }
+
             Utils.run(d8cmd.toArray(new String[0]));
 
             Path dex = dexDir.resolve("classes.dex");
             if (!Files.exists(dex)) Utils.error("d8 did not produce classes.dex");
 
             if (keepDex) {
-                // ── dex only (skip baksmali) ──
                 Files.createDirectories(out);
                 Path dexOut = out.resolve("classes.dex");
                 Files.copy(dex, dexOut, StandardCopyOption.REPLACE_EXISTING);
                 System.out.println("Dex output: " + dexOut);
             } else {
-                // ── baksmali ──
                 Files.createDirectories(out);
                 Utils.run("java", "-cp", selfJar,
                         "com.android.tools.smali.baksmali.Main",
