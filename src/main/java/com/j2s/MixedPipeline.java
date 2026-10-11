@@ -6,21 +6,7 @@ import java.util.*;
 import java.util.stream.*;
 
 /**
- * Mixed Java + Kotlin pipeline:
- *
- *   .java + .kt
- *        │
- *        ├─(kotlinc, sees both)──► .class (only for .kt)
- *        │
- *        ├─(javac, with kotlinc output on cp)──► .class (for .java)
- *        │
- *        └─(d8 + baksmali via JavaPipeline)──► .smali / .dex
- *
- * kotlinc is given the .java files too so Kotlin code can reference Java
- * symbols (and vice-versa) in a single pass. javac then compiles the .java
- * files that kotlinc did not emit classes for.
- *
- * <p>kotlin-stdlib is auto-located near kotlinc and merged into the dex.
+ * Mixed Java + Kotlin pipeline。
  */
 public final class MixedPipeline {
 
@@ -30,10 +16,18 @@ public final class MixedPipeline {
                            Path out,
                            Path androidJar,
                            List<Path> libs,
+                           List<Path> deps,
                            int minApi,
                            boolean keepDex,
                            String selfJar,
-                           String kotlinHome) throws Exception {
+                           String kotlinHome,
+                           String composePlugin,
+                           Path manifest,
+                           Path resDir,
+                           List<Path> extraResDirs,
+                           Path aapt2Exe,
+                           Path outApk,
+                           Integer targetSdk) throws Exception {
 
         Path work = Files.createTempDirectory("j2s-mix-");
         try {
@@ -50,13 +44,25 @@ public final class MixedPipeline {
                     })
                     .collect(Collectors.toList());
 
-            // ── 1. kotlinc sees both .kt and .java ──
             Path kotlinc = KotlinPipeline.resolveKotlinc(kotlinHome);
             if (kotlinc == null) {
                 Utils.error("kotlinc not found. Install the Kotlin compiler "
-                          + "and make sure it is on PATH, or pass --kotlin-home <dir>.");
+                        + "and make sure it is on PATH, or pass --kotlin-home <dir>.");
             }
 
+            // ── 0. aapt2 ──
+            Path baseApk = null;
+            List<Path> rClasses = Collections.emptyList();
+            if (manifest != null && aapt2Exe != null) {
+                System.out.println("=== aapt2: resources + manifest ===");
+                Aapt2Builder.Result r = Aapt2Builder.process(
+                        androidJar, manifest, resDir, extraResDirs,
+                        work, aapt2Exe, minApi, targetSdk);
+                baseApk = r.baseApk;
+                rClasses = Aapt2Builder.compileRJava(r.genDir, androidJar, work);
+            }
+
+            // ── 1. kotlinc ──
             List<String> ktCmd = new ArrayList<>();
             ktCmd.add(kotlinc.toString());
             ktCmd.add("-d");
@@ -64,22 +70,28 @@ public final class MixedPipeline {
             ktCmd.add("-jvm-target");
             ktCmd.add("1.8");
 
+            if (composePlugin != null) {
+                ktCmd.add("-Xplugin=" + composePlugin);
+                System.out.println("Compose plugin: " + composePlugin);
+            }
+
             List<String> cp = new ArrayList<>();
             if (androidJar != null) cp.add(androidJar.toString());
-            for (Path lib : libs)   cp.add(lib.toString());
+            for (Path lib : libs) cp.add(lib.toString());
+            for (Path dep : deps) cp.add(dep.toString());
             if (!cp.isEmpty()) {
                 ktCmd.add("-classpath");
                 ktCmd.add(String.join(File.pathSeparator, cp));
             }
 
-            for (Path kt : ktFiles)   ktCmd.add(kt.toString());
+            for (Path kt : ktFiles) ktCmd.add(kt.toString());
             for (Path jf : javaFiles) ktCmd.add(jf.toString());
 
             System.out.println("kotlinc " + ktFiles.size() + " .kt + "
-                             + javaFiles.size() + " .java (symbol resolution) ...");
+                    + javaFiles.size() + " .java (symbol resolution) ...");
             Utils.run(ktCmd.toArray(new String[0]));
 
-            // ── 2. javac compiles the .java sources, with kotlinc output on cp ──
+            // ── 2. javac ──
             if (!javaFiles.isEmpty()) {
                 List<String> javacArgs = new ArrayList<>();
                 javacArgs.add("javac");
@@ -92,9 +104,10 @@ public final class MixedPipeline {
                 javacArgs.add("-Xlint:-options");
 
                 List<String> javacCp = new ArrayList<>();
-                javacCp.add(classesDir.toString());   // kotlinc output
+                javacCp.add(classesDir.toString());
                 if (androidJar != null) javacCp.add(androidJar.toString());
-                for (Path lib : libs)   javacCp.add(lib.toString());
+                for (Path lib : libs) javacCp.add(lib.toString());
+                for (Path dep : deps) javacCp.add(dep.toString());
                 javacArgs.add("-cp");
                 javacArgs.add(String.join(File.pathSeparator, javacCp));
 
@@ -103,29 +116,30 @@ public final class MixedPipeline {
                 Utils.run(javacArgs.toArray(new String[0]));
             }
 
-            // ── 3. Collect every .class ──
+            // ── 3. 收集 .class + R.class ──
             List<Path> classFiles;
             try (Stream<Path> s = Files.walk(classesDir)) {
                 classFiles = s.filter(p -> p.toString().endsWith(".class"))
-                              .collect(Collectors.toList());
+                        .collect(Collectors.toList());
             }
             if (classFiles.isEmpty()) Utils.error("No .class files produced");
+            classFiles.addAll(rClasses);
             System.out.println("Compiled " + classFiles.size() + " classes total");
 
-            // ── 4. Locate kotlin-stdlib and merge into the dex ──
-            List<Path> stdlibJars = KotlinPipeline.resolveKotlinStdlib(kotlinc);
-            if (stdlibJars.isEmpty()) {
-                System.out.println("Warning: kotlin-stdlib not found near kotlinc; "
-                                 + "runtime may fail with NoClassDefFoundError. "
-                                 + "Pass -l <kotlin-stdlib.jar> to include it explicitly.");
-            } else {
-                System.out.println("Merging kotlin-stdlib (" + stdlibJars.size() + " jar(s)):");
-                for (Path j : stdlibJars) System.out.println("  " + j);
+            // ── 4. 合并 stdlib + deps ──
+            LinkedHashSet<Path> mergeSet = new LinkedHashSet<>();
+            mergeSet.addAll(KotlinPipeline.resolveKotlinStdlib(kotlinc));
+            mergeSet.addAll(deps);
+            List<Path> mergeJars = new ArrayList<>(mergeSet);
+
+            if (!mergeJars.isEmpty()) {
+                System.out.println("Merging " + mergeJars.size() + " jar(s) into dex:");
+                for (Path j : mergeJars) System.out.println("  " + j);
             }
 
             JavaPipeline.compileClassesToDex(
                     classFiles, out, androidJar, libs, minApi, keepDex, selfJar,
-                    stdlibJars);
+                    mergeJars, baseApk, outApk);
 
         } finally {
             KotlinPipeline.deleteRecursive(work);
