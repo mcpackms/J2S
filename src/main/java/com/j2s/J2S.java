@@ -1,5 +1,6 @@
 package com.j2s;
 
+import java.io.IOException;
 import java.nio.file.*;
 import java.util.*;
 
@@ -12,43 +13,52 @@ import java.util.*;
  *   <li>{@code .kt} / {@code .kts}   → Kotlin compilation pipeline (K2S)</li>
  *   <li>{@code .java} + {@code .kt}  → Mixed Java + Kotlin pipeline</li>
  *   <li>{@code .dex}                 → Dex disassembly or dex2jar</li>
- *   <li>{@code .jar}                 → D8 compression to dex jar</li>
+ *   <li>{@code .jar}                 → D8 compression to dex</li>
  * </ul>
  *
  * <p>Source modes support:
  * <ul>
- *   <li>{@code -D/--dep} Maven dependency resolution (AAR + transitive)</li>
+ *   <li>{@code -D/--dep} Maven dependency resolution (transitive, BOM + AAR aware)</li>
  *   <li>{@code --manifest} + {@code --res} + {@code --apk} full APK build with aapt2</li>
- *   <li>{@code --compose-plugin-version} Compose compiler plugin auto-resolve</li>
+ *   <li>{@code --compose-plugin} / {@code --compose-plugin-version} Compose compiler plugin</li>
  *   <li>Multidex output (classes.dex, classes2.dex, ...)</li>
- *   <li>AAR {@code res/} dirs auto-merged into aapt2</li>
  * </ul>
  */
 public class J2S {
 
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
+        try {
+            run(args);
+        } catch (Exception e) {
+            boolean verbose = false;
+            for (String a : args) {
+                if (a.equals("-v") || a.equals("--verbose")) verbose = true;
+            }
+            if (verbose) e.printStackTrace();
+            String msg = e.getMessage();
+            Utils.error(msg == null || msg.isEmpty() ? e.toString() : msg);
+        }
+    }
+
+    private static void run(String[] args) throws Exception {
         String selfJar = Utils.getJarPath();
         if (selfJar == null) {
             Utils.error("Cannot determine J2S.jar path. Run with java -jar J2S.jar");
         }
 
-        if (args.length == 0) usage();
-
-        // 必须在 inputFiles.isEmpty() 检查之前，以便 --clear-dex-cache 可单独使用
+        if (args.length == 0) usage(1);
 
         // ── Parsed options ──
         Path out = Paths.get("smali_out");
         Path androidJar = null;
         List<Path> libs = new ArrayList<>();
         List<Path> inputFiles = new ArrayList<>();
-        List<String> depCoords = new ArrayList<>();
-        List<String> extraRepos = new ArrayList<>();
-        Path cacheDir = null;
         String composePlugin = null;
         String composePluginVersion = null;
         String kotlinHome = null;
         Path manifest = null;
         Path resDir = null;
+        Path assetsDir = null;
         String aapt2Path = null;
         Path outApk = null;
         Integer targetSdk = null;
@@ -59,6 +69,20 @@ public class J2S {
         Path dexCacheRoot = null;
         boolean noDexCache = false;
         boolean clearDexCache = false;
+
+        // ── Dependency resolution options ──
+        List<String> depCoords = new ArrayList<>();
+        List<String> extraRepos = new ArrayList<>();
+        List<String> excludes = new ArrayList<>();
+        Path localRepo = null;
+        Path settingsPath = null;
+        boolean offline = false;
+        boolean noTransitive = false;
+        boolean manifestMerge = true;
+        Path dexresPath = null;
+        Path depLockFile = null;
+        boolean updateDepLock = false;
+        boolean verbose = false;
 
         int i = 0;
         while (i < args.length) {
@@ -79,15 +103,57 @@ public class J2S {
                     break;
                 case "-D": case "--dep":
                     if (++i < args.length) depCoords.add(args[i]);
-                    else Utils.error("Missing coordinate after " + args[i-1]);
+                    else Utils.error("Missing Maven coordinate after " + args[i-1]);
                     break;
                 case "--repo":
                     if (++i < args.length) extraRepos.add(args[i]);
-                    else Utils.error("Missing url after --repo");
+                    else Utils.error("Missing URL after --repo");
                     break;
-                case "--cache-dir":
-                    if (++i < args.length) cacheDir = Paths.get(args[i]).toAbsolutePath();
-                    else Utils.error("Missing dir after --cache-dir");
+                case "--local-repo": case "--cache-dir":
+                    if (++i < args.length) localRepo = Paths.get(args[i]).toAbsolutePath();
+                    else Utils.error("Missing directory after " + args[i-1]);
+                    break;
+                case "--settings":
+                    if (++i < args.length) {
+                        settingsPath = Paths.get(args[i]).toAbsolutePath();
+                        if (!Files.isRegularFile(settingsPath)) {
+                            Utils.error(settingsPath + " does not exist");
+                        }
+                    } else Utils.error("Missing file after --settings");
+                    break;
+                case "--offline":
+                    offline = true;
+                    break;
+                case "--no-transitive":
+                    noTransitive = true;
+                    break;
+                case "--exclude":
+                    if (++i < args.length) {
+                        String e = args[i].trim();
+                        if (!e.contains(":")) Utils.error("--exclude expects group:artifact, got " + e);
+                        excludes.add(e);
+                    } else Utils.error("Missing group:artifact after --exclude");
+                    break;
+                case "--compose-plugin-version":
+                    if (++i < args.length) composePluginVersion = args[i];
+                    else Utils.error("Missing version after --compose-plugin-version");
+                    break;
+                case "--dexres":
+                    if (++i < args.length) dexresPath = Paths.get(args[i]).toAbsolutePath();
+                    else Utils.error("Missing file after --dexres");
+                    break;
+                case "--dep-lock":
+                    if (++i < args.length) depLockFile = Paths.get(args[i]).toAbsolutePath();
+                    else Utils.error("Missing file after --dep-lock");
+                    break;
+                case "--update-dep-lock":
+                    updateDepLock = true;
+                    break;
+                case "--no-manifest-merge":
+                    manifestMerge = false;
+                    break;
+                case "-v": case "--verbose":
+                    verbose = true;
                     break;
                 case "--dex-cache":
                     if (++i < args.length) dexCacheRoot = Paths.get(args[i]).toAbsolutePath();
@@ -106,10 +172,6 @@ public class J2S {
                         composePlugin = cp.toString();
                     } else Utils.error("Missing jar after --compose-plugin");
                     break;
-                case "--compose-plugin-version":
-                    if (++i < args.length) composePluginVersion = args[i];
-                    else Utils.error("Missing version after --compose-plugin-version");
-                    break;
                 case "--manifest":
                     if (++i < args.length) {
                         manifest = Paths.get(args[i]).toAbsolutePath();
@@ -121,6 +183,12 @@ public class J2S {
                         resDir = Paths.get(args[i]).toAbsolutePath();
                         if (!Files.isDirectory(resDir)) Utils.error(resDir + " is not a directory");
                     } else Utils.error("Missing dir after --res");
+                    break;
+                case "--assets":
+                    if (++i < args.length) {
+                        assetsDir = Paths.get(args[i]).toAbsolutePath();
+                        if (!Files.isDirectory(assetsDir)) Utils.error(assetsDir + " is not a directory");
+                    } else Utils.error("Missing dir after --assets");
                     break;
                 case "--aapt2":
                     if (++i < args.length) aapt2Path = args[i];
@@ -152,6 +220,9 @@ public class J2S {
                     if (++i < args.length) kotlinHome = args[i];
                     else Utils.error("Missing path after --kotlin-home");
                     break;
+                case "-h": case "--help":
+                    usage(0);
+                    break;
                 default:
                     Path p = Paths.get(args[i]).toAbsolutePath();
                     if (!Files.exists(p)) Utils.error(p + " does not exist");
@@ -167,7 +238,7 @@ public class J2S {
             i++;
         }
 
-        // ── Dex 缓存 ──
+        // ── Dex cache ──
         DexCache.configure(dexCacheRoot, !noDexCache);
         if (clearDexCache) {
             System.out.println("Dex cache: " + DexCache.root());
@@ -207,8 +278,6 @@ public class J2S {
             Utils.error("--jar only applies to .dex input");
         if (keepDex && makeJar)
             Utils.error("--keep-dex and --jar are mutually exclusive");
-        if ((!depCoords.isEmpty() || composePluginVersion != null) && !sourceMode)
-            Utils.error("-D / --compose-plugin-version only apply to .java / .kt input");
         if (outApk != null && manifest == null)
             Utils.error("--apk requires --manifest");
         if (manifest != null && outApk == null)
@@ -217,6 +286,20 @@ public class J2S {
             Utils.error("--manifest only applies to .java / .kt input");
         if (resDir != null && manifest == null)
             Utils.error("--res requires --manifest (and --apk)");
+        if (assetsDir != null && manifest == null)
+            Utils.error("--assets requires --manifest (and --apk)");
+        if (manifest != null && androidJar == null)
+            Utils.error("APK builds require -a/--android-jar (aapt2 link needs android.jar)");
+        if ((!depCoords.isEmpty() || composePluginVersion != null) && !sourceMode)
+            Utils.error("-D / --compose-plugin-version only apply to .java / .kt input");
+        if (dexresPath != null && !sourceMode)
+            Utils.error("--dexres only applies to .java / .kt input");
+        if (depLockFile != null && depCoords.isEmpty())
+            Utils.error("--dep-lock requires -D/--dep");
+        if (updateDepLock && depLockFile == null)
+            Utils.error("--update-dep-lock requires --dep-lock");
+        if (composePlugin != null && composePluginVersion != null)
+            Utils.error("--compose-plugin and --compose-plugin-version are mutually exclusive");
 
         // ── Infer default output path ──
         if (hasJar && !outSpecified) {
@@ -247,65 +330,132 @@ public class J2S {
         }
 
         // ── Resolve Maven dependencies ──
-        List<Path> depJars = new ArrayList<>();
-        List<Path> aarResDirs = Collections.emptyList();
-
-        if (sourceMode && (!depCoords.isEmpty() || composePluginVersion != null)) {
-            DependencyResolver resolver = new DependencyResolver(cacheDir, extraRepos);
-
-            for (String coord : depCoords) {
-                System.out.println("Resolving " + coord + " ...");
-                try {
-                    List<Path> jars = resolver.resolve(coord);
-                    for (Path jar : jars) {
-                        System.out.println("  " + jar);
-                        depJars.add(jar);
-                    }
-                } catch (Exception e) {
-                    Utils.error("Failed to resolve " + coord + ": " + e.getMessage());
-                }
+        DepResources resources = DepResources.EMPTY;
+        boolean dependencyRequested = !depCoords.isEmpty() || composePluginVersion != null;
+        if (sourceMode && dependencyRequested) {
+            RepoConfig cfg = RepoConfig.create(localRepo, extraRepos, offline,
+                    !noTransitive, excludes, settingsPath);
+            if (!cfg.hasRemotes()) {
+                System.err.println("Warning: " + cfg.reminder());
+            }
+            if (verbose) {
+                System.out.println("Dependency configuration:");
+                System.out.print(cfg.describe());
             }
 
-            // Collect AAR res dirs (for aapt2)
-            aarResDirs = resolver.getAarResDirs();
-            if (!aarResDirs.isEmpty()) {
-                System.out.println("Found " + aarResDirs.size() + " AAR res dir(s):");
-                for (Path r : aarResDirs) System.out.println("  " + r);
+            DependencyResolver resolver;
+            try {
+                resolver = new DependencyResolver(cfg);
+            } catch (Exception e) {
+                Utils.error("Cannot initialize Maven resolver: " + e.getMessage());
+                return;
+            }
+
+            if (!depCoords.isEmpty()) {
+                try {
+                    resources = resolver.resolve(depCoords);
+                } catch (Exception e) {
+                    Utils.error(e.getMessage());
+                }
+                System.out.println("Dependencies: " + resources.summary());
+                if (verbose) {
+                    for (DepResources.ResolvedArtifact a : resources.artifacts) {
+                        System.out.println("  " + a.coord);
+                    }
+                }
+                if (resources.hasAarResources()) {
+                    Path dexres = dexresPath != null
+                            ? dexresPath
+                            : defaultDexResPath(outApk, out);
+                    try {
+                        resources.writeDexResZip(dexres);
+                    } catch (IOException e) {
+                        System.err.println("Warning: cannot write " + dexres + " (" + e + ")");
+                    }
+                }
+                if (depLockFile != null) {
+                    try {
+                        DepLock.writeOrVerify(depLockFile, updateDepLock, resources, cfg);
+                    } catch (Exception e) {
+                        Utils.error(e.getMessage());
+                    }
+                }
             }
 
             if (composePluginVersion != null) {
-                String coord = "androidx.compose.compiler:compiler:" + composePluginVersion;
-                System.out.println("Resolving " + coord + " ...");
                 try {
-                    Path plugin = resolver.resolveSingle(coord);
-                    composePlugin = plugin.toString();
-                    System.out.println("  " + plugin);
+                    composePlugin = resolveComposePlugin(resolver, composePluginVersion).toString();
                 } catch (Exception e) {
-                    Utils.error("Failed to resolve compose plugin: " + e.getMessage());
+                    Utils.error("Cannot resolve Compose compiler plugin "
+                            + composePluginVersion + ": " + e.getMessage());
                 }
+                System.out.println("Compose plugin: " + composePlugin);
             }
         }
 
         // ── Dispatch ──
+        BuildContext ctx = new BuildContext();
+        ctx.androidJar = androidJar;
+        ctx.libs = libs;
+        ctx.deps = resources.jars;
+        ctx.minApi = minApi;
+        ctx.keepDex = keepDex;
+        ctx.selfJar = selfJar;
+        ctx.kotlinHome = kotlinHome;
+        ctx.composePlugin = composePlugin;
+        ctx.manifest = manifest;
+        ctx.resDir = resDir;
+        ctx.assetsDir = assetsDir;
+        ctx.resources = resources;
+        ctx.aapt2Exe = aapt2Exe;
+        ctx.outApk = outApk;
+        ctx.targetSdk = targetSdk;
+        ctx.manifestMerge = manifestMerge;
+
         if (hasJar) {
             JarDex.run(inputFiles, out, androidJar, libs, minApi, selfJar);
         } else if (hasDex) {
             if (makeJar) DexJar.run(inputFiles, out);
             else         DexSmali.run(inputFiles, out, selfJar);
         } else if (mixedMode) {
-            MixedPipeline.run(inputFiles, out, androidJar, libs, depJars, minApi,
-                    keepDex, selfJar, kotlinHome, composePlugin,
-                    manifest, resDir, aarResDirs, aapt2Exe, outApk, targetSdk);
+            MixedPipeline.run(inputFiles, out, ctx);
         } else if (kotlinOnly) {
-            KotlinPipeline.run(inputFiles, out, androidJar, libs, depJars, minApi,
-                    keepDex, selfJar, kotlinHome, composePlugin,
-                    manifest, resDir, aarResDirs, aapt2Exe, outApk, targetSdk);
+            KotlinPipeline.run(inputFiles, out, ctx);
         } else {
-            JavaPipeline.run(inputFiles, out, androidJar, libs, minApi, keepDex, selfJar);
+            JavaPipeline.run(inputFiles, out, ctx);
         }
     }
 
-    static void usage() {
+    /** Default location of dexres.zip: next to the APK, otherwise inside the output directory. */
+    private static Path defaultDexResPath(Path outApk, Path out) {
+        if (outApk != null && outApk.getParent() != null) {
+            return outApk.getParent().resolve("dexres.zip").toAbsolutePath();
+        }
+        return out.toAbsolutePath().resolve("dexres.zip");
+    }
+
+    /**
+     * Resolve the Compose compiler plugin. Kotlin 1.9- uses
+     * {@code androidx.compose.compiler:compiler}, Kotlin 2.x ships it as
+     * {@code org.jetbrains.kotlin:kotlin-compose-compiler-plugin-embeddable}.
+     */
+    private static Path resolveComposePlugin(DependencyResolver resolver, String version)
+            throws Exception {
+        try {
+            return resolver.resolveSingle("androidx.compose.compiler:compiler:" + version);
+        } catch (Exception first) {
+            try {
+                return resolver.resolveSingle(
+                        "org.jetbrains.kotlin:kotlin-compose-compiler-plugin-embeddable:" + version);
+            } catch (Exception second) {
+                throw new Exception("tried androidx.compose.compiler:compiler and "
+                        + "org.jetbrains.kotlin:kotlin-compose-compiler-plugin-embeddable. "
+                        + first.getMessage());
+            }
+        }
+    }
+
+    static void usage(int exitCode) {
         System.err.println("Usage: java -jar J2S.jar [options] <src.java... | src.kt... | src.dex... | src.jar...>");
         System.err.println();
         System.err.println("Modes (detected by input file extension):");
@@ -315,12 +465,37 @@ public class J2S {
         System.err.println("    --keep-dex             Skip smali, output .dex only");
         System.err.println("    --kotlin-home <p>      Override kotlinc location (default: PATH)");
         System.err.println("    --compose-plugin <jar> Compose compiler plugin jar (-Xplugin)");
-        System.err.println("    --compose-plugin-version <v>  Auto-resolve compose plugin from Maven");
         System.err.println("  Mixed mode (.java+.kt)   Compile together -> .class -> .dex -> .smali");
         System.err.println("    --keep-dex             Skip smali, output .dex only");
         System.err.println("  Dex mode (.dex)          Disassemble .dex -> .smali");
         System.err.println("    --jar                  Convert .dex -> .jar (dex2jar)");
         System.err.println("  Jar mode (.jar)          Compress .jar -> .dex.jar (D8)");
+        System.err.println();
+        System.err.println("Maven dependencies (source modes only):");
+        System.err.println("  -D, --dep <g:a[:v][:classifier][@jar|aar|pom]>");
+        System.err.println("                           Maven coordinate (repeatable). A BOM (packaging=pom)");
+        System.err.println("                           imports dependencyManagement; later -D may omit <v>.");
+        System.err.println("  --repo <url>             Maven repository URL (repeatable). NO repository is");
+        System.err.println("                           configured by default; set --repo or " + RepoConfig.ENV_REPOS + ".");
+        System.err.println("  --local-repo <dir>       Maven local repository (default: ~/.m2/repository)");
+        System.err.println("  --settings <file>        Maven settings.xml (mirrors/proxies/servers)");
+        System.err.println("  --offline                Resolve from the local repository only");
+        System.err.println("  --no-transitive          Do not resolve transitive dependencies");
+        System.err.println("  --exclude <g:a>          Exclude group:artifact from transitive resolution");
+        System.err.println("  --compose-plugin-version <v>  Resolve the Compose compiler plugin from Maven");
+        System.err.println("  --dexres <file>          Where to write AAR resources as a zip");
+        System.err.println("                           (default: next to --apk, else <out>/dexres.zip)");
+        System.err.println("  --assets <dir>           User assets dir for APK builds (merged on top of AAR assets)");
+        System.err.println("  --dep-lock <file>        Write/verify a dependency lock file (SHA-256 of artifacts)");
+        System.err.println("  --update-dep-lock        Update an existing lock file instead of verifying it");
+        System.err.println();
+        System.err.println("Environment variables:");
+        System.err.println("  " + RepoConfig.ENV_REPOS + "            Comma separated Maven repository URLs");
+        System.err.println("  " + RepoConfig.ENV_LOCAL_REPO + "        Maven local repository directory (" + RepoConfig.ENV_M2 + " works too)");
+        System.err.println("  " + RepoConfig.ENV_OFFLINE + "            1/true = offline mode");
+        System.err.println("  " + RepoConfig.ENV_SETTINGS + "   settings.xml path");
+        System.err.println("  " + RepoConfig.ENV_PROXY + "              HTTP proxy: [http://][user:pass@]host:port");
+        System.err.println("  " + RepoConfig.ENV_NO_PROXY + "           Comma separated hosts that bypass the proxy");
         System.err.println();
         System.err.println("APK build (requires --manifest and --apk):");
         System.err.println("  --manifest <file>    AndroidManifest.xml");
@@ -328,14 +503,9 @@ public class J2S {
         System.err.println("  --apk <file>         Output APK");
         System.err.println("  --target-sdk <N>     Target SDK (default: 34)");
         System.err.println("  --aapt2 <path>       Explicit aapt2 path (default: PATH / SDK)");
+        System.err.println("  --no-manifest-merge  Do not merge AAR AndroidManifest.xml files");
         System.err.println();
-        System.err.println("Maven dependencies:");
-        System.err.println("  -D, --dep <g:a:v>    Maven coordinate, auto-downloaded & merged (repeatable)");
-        System.err.println("                       AARs are automatically unpacked (classes.jar + res/)");
-        System.err.println("  --repo <url>         Extra Maven repository URL (repeatable)");
-        System.err.println("  --cache-dir <path>   Maven local repo (default: ~/.m2/repository)");
-        System.err.println();
-        System.err.println("Dex cache (stdlib / dependencies are dexed once, then reused):");
+        System.err.println("Dex cache (dependencies are dexed once, then reused):");
         System.err.println("  --dex-cache <path>   Cache dir (default: $J2S_CACHE/dex,");
         System.err.println("                       $XDG_CACHE_HOME/j2s/dex, ~/.cache/j2s/dex)");
         System.err.println("  --no-dex-cache       Disable the dex cache");
@@ -344,18 +514,21 @@ public class J2S {
         System.err.println("Other options:");
         System.err.println("  -o <path>            Output path");
         System.err.println("  -a, --android-jar    Android framework jar");
-        System.err.println("  -l, --lib <jar>      Additional library jar (repeatable, --lib reference)");
+        System.err.println("  -l, --lib <jar>      Additional library jar (repeatable, not merged)");
         System.err.println("  --min-api <N>        Minimum API level for D8 (default: 21)");
+        System.err.println("  -v, --verbose        Verbose output (resolved artifacts, config)");
+        System.err.println("  -h, --help           Show this help");
         System.err.println();
         System.err.println("Examples:");
         System.err.println("  java -jar J2S.jar Hello.java");
         System.err.println("  java -jar J2S.jar Hello.kt");
         System.err.println("  java -jar J2S.jar Main.kt Util.java");
-        System.err.println("  java -jar J2S.jar --keep-dex -D androidx.compose.ui:ui:1.6.0 \\");
-        System.err.println("      --compose-plugin-version 1.5.12 Main.kt");
+        System.err.println("  export " + RepoConfig.ENV_REPOS + "=https://repo.maven.apache.org/maven2");
+        System.err.println("  java -jar J2S.jar -D junit:junit:4.13.2 --keep-dex Hello.java");
+        System.err.println("  java -jar J2S.jar -D androidx.compose:compose-bom:2024.02.00 \\");
+        System.err.println("      -D androidx.compose.ui:ui --keep-dex Main.kt");
         System.err.println("  java -jar J2S.jar --apk app.apk --manifest AndroidManifest.xml \\");
-        System.err.println("      --res res/ --keep-dex -a android.jar \\");
-        System.err.println("      -D androidx.appcompat:appcompat:1.6.1 Main.kt");
-        System.exit(1);
+        System.err.println("      --res res/ -D androidx.appcompat:appcompat:1.6.1 Main.kt");
+        System.exit(exitCode);
     }
 }

@@ -22,6 +22,7 @@
         <r8.version>9.1.31</r8.version>
         <dex2jar.version>2.4.28</dex2jar.version>
         <aether.version>1.9.18</aether.version>
+        <junit.version>5.10.2</junit.version>
     </properties>
 
     <dependencies>
@@ -43,7 +44,7 @@
             <version>${dex2jar.version}</version>
         </dependency>
 
-        <!-- Maven Resolver (Aether) — 自动下载依赖 -->
+        <!-- Maven Resolver (Aether) - dependency download + transitive resolution -->
         <dependency>
             <groupId>org.apache.maven.resolver</groupId>
             <artifactId>maven-resolver-supplier</artifactId>
@@ -54,12 +55,26 @@
             <artifactId>maven-resolver-provider</artifactId>
             <version>3.9.6</version>
         </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Maven Resolver logs through SLF4J; keep the CLI output clean. -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-nop</artifactId>
+            <version>1.7.36</version>
+        </dependency>
     </dependencies>
 
     <build>
         <finalName>J2S</finalName>
 
-        <!-- j2s-build.properties: 用于 DexCache 指纹（改动 pom 属性即自动同步） -->
+        <!-- j2s-build.properties: used by DexCache fingerprint (auto-synced from pom properties) -->
         <resources>
             <resource>
                 <directory>src/main/resources</directory>
@@ -71,11 +86,20 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.8.1</version>
+                <version>3.13.0</version>
                 <configuration>
                     <source>1.8</source>
                     <target>1.8</target>
                     <encoding>UTF-8</encoding>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <useModulePath>false</useModulePath>
                 </configuration>
             </plugin>
 
@@ -113,6 +137,8 @@
                                         <exclude>META-INF/NOTICE</exclude>
                                         <exclude>META-INF/NOTICE.txt</exclude>
                                         <exclude>META-INF/DEPENDENCIES</exclude>
+                                        <exclude>module-info.class</exclude>
+                                        <exclude>META-INF/versions/*/module-info.class</exclude>
                                     </excludes>
                                 </filter>
                             </filters>
@@ -139,15 +165,11 @@
     </build>
 
     <repositories>
+        <!-- Aliyun Google mirror: contains com.android.tools:r8 and smali-baksmali -->
         <repository>
-            <id>google</id>
-            <name>Google Maven</name>
-            <url>https://maven.google.com</url>
-        </repository>
-        <repository>
-            <id>central</id>
-            <name>Maven Central</name>
-            <url>https://repo.maven.apache.org/maven2</url>
+            <id>aliyun-google</id>
+            <name>Aliyun Google Mirror</name>
+            <url>https://maven.aliyun.com/repository/google</url>
         </repository>
     </repositories>
 </project>

@@ -6,29 +6,13 @@ import java.util.*;
 import java.util.stream.*;
 
 /**
- * Mixed Java + Kotlin pipeline。
+ * Mixed Java + Kotlin pipeline.
  */
 public final class MixedPipeline {
 
     private MixedPipeline() {}
 
-    public static void run(List<Path> inputs,
-                           Path out,
-                           Path androidJar,
-                           List<Path> libs,
-                           List<Path> deps,
-                           int minApi,
-                           boolean keepDex,
-                           String selfJar,
-                           String kotlinHome,
-                           String composePlugin,
-                           Path manifest,
-                           Path resDir,
-                           List<Path> extraResDirs,
-                           Path aapt2Exe,
-                           Path outApk,
-                           Integer targetSdk) throws Exception {
-
+    public static void run(List<Path> inputs, Path out, BuildContext ctx) throws Exception {
         Path work = Files.createTempDirectory("j2s-mix-");
         try {
             Path classesDir = work.resolve("classes");
@@ -44,7 +28,7 @@ public final class MixedPipeline {
                     })
                     .collect(Collectors.toList());
 
-            Path kotlinc = KotlinPipeline.resolveKotlinc(kotlinHome);
+            Path kotlinc = KotlinPipeline.resolveKotlinc(ctx.kotlinHome);
             if (kotlinc == null) {
                 Utils.error("kotlinc not found. Install the Kotlin compiler "
                         + "and make sure it is on PATH, or pass --kotlin-home <dir>.");
@@ -53,32 +37,39 @@ public final class MixedPipeline {
             // ── 0. aapt2 ──
             Path baseApk = null;
             List<Path> rClasses = Collections.emptyList();
-            if (manifest != null && aapt2Exe != null) {
+            if (ctx.manifest != null && ctx.aapt2Exe != null) {
                 System.out.println("=== aapt2: resources + manifest ===");
                 Aapt2Builder.Result r = Aapt2Builder.process(
-                        androidJar, manifest, resDir, extraResDirs,
-                        work, aapt2Exe, minApi, targetSdk);
+                        ctx.androidJar, ctx.manifest, ctx.resDir,
+                        ctx.resources.resDirs(), ctx.resources.aarManifests(),
+                        ctx.resources.assetsDirs(), ctx.assetsDir,
+                        work, ctx.aapt2Exe, ctx.minApi, ctx.targetSdk, ctx.manifestMerge);
                 baseApk = r.baseApk;
-                rClasses = Aapt2Builder.compileRJava(r.genDir, androidJar, work);
+                rClasses = Aapt2Builder.compileRJava(r.genDir, ctx.androidJar, work);
             }
 
             // ── 1. kotlinc ──
             List<String> ktCmd = new ArrayList<>();
             ktCmd.add(kotlinc.toString());
+
+            // JVM tuning + Kotlin daemon (-J flags are forwarded to the JVM by the kotlinc script).
+            ktCmd.addAll(Arrays.asList(KotlinPipeline.JVM_OPTS));
+            ktCmd.addAll(Arrays.asList(KotlinPipeline.DAEMON_OPTS));
+
             ktCmd.add("-d");
             ktCmd.add(classesDir.toString());
             ktCmd.add("-jvm-target");
             ktCmd.add("1.8");
 
-            if (composePlugin != null) {
-                ktCmd.add("-Xplugin=" + composePlugin);
-                System.out.println("Compose plugin: " + composePlugin);
+            if (ctx.composePlugin != null) {
+                ktCmd.add("-Xplugin=" + ctx.composePlugin);
+                System.out.println("Compose plugin: " + ctx.composePlugin);
             }
 
             List<String> cp = new ArrayList<>();
-            if (androidJar != null) cp.add(androidJar.toString());
-            for (Path lib : libs) cp.add(lib.toString());
-            for (Path dep : deps) cp.add(dep.toString());
+            if (ctx.androidJar != null) cp.add(ctx.androidJar.toString());
+            for (Path lib : ctx.libs) cp.add(lib.toString());
+            for (Path dep : ctx.deps) cp.add(dep.toString());
             if (!cp.isEmpty()) {
                 ktCmd.add("-classpath");
                 ktCmd.add(String.join(File.pathSeparator, cp));
@@ -95,6 +86,12 @@ public final class MixedPipeline {
             if (!javaFiles.isEmpty()) {
                 List<String> javacArgs = new ArrayList<>();
                 javacArgs.add("javac");
+
+                // JVM tuning for javac (short-lived, but still benefits from a larger heap).
+                javacArgs.add("-J-Xms256m");
+                javacArgs.add("-J-Xmx1g");
+                javacArgs.add("-J-XX:+UseParallelGC");
+
                 javacArgs.add("-d");
                 javacArgs.add(classesDir.toString());
                 javacArgs.add("-source");
@@ -105,9 +102,9 @@ public final class MixedPipeline {
 
                 List<String> javacCp = new ArrayList<>();
                 javacCp.add(classesDir.toString());
-                if (androidJar != null) javacCp.add(androidJar.toString());
-                for (Path lib : libs) javacCp.add(lib.toString());
-                for (Path dep : deps) javacCp.add(dep.toString());
+                if (ctx.androidJar != null) javacCp.add(ctx.androidJar.toString());
+                for (Path lib : ctx.libs) javacCp.add(lib.toString());
+                for (Path dep : ctx.deps) javacCp.add(dep.toString());
                 javacArgs.add("-cp");
                 javacArgs.add(String.join(File.pathSeparator, javacCp));
 
@@ -116,7 +113,7 @@ public final class MixedPipeline {
                 Utils.run(javacArgs.toArray(new String[0]));
             }
 
-            // ── 3. 收集 .class + R.class ──
+            // ── 3. Collect .class files + R.class ──
             List<Path> classFiles;
             try (Stream<Path> s = Files.walk(classesDir)) {
                 classFiles = s.filter(p -> p.toString().endsWith(".class"))
@@ -126,10 +123,10 @@ public final class MixedPipeline {
             classFiles.addAll(rClasses);
             System.out.println("Compiled " + classFiles.size() + " classes total");
 
-            // ── 4. 合并 stdlib + deps ──
+            // ── 4. Merge stdlib + deps ──
             LinkedHashSet<Path> mergeSet = new LinkedHashSet<>();
             mergeSet.addAll(KotlinPipeline.resolveKotlinStdlib(kotlinc));
-            mergeSet.addAll(deps);
+            mergeSet.addAll(ctx.deps);
             List<Path> mergeJars = new ArrayList<>(mergeSet);
 
             if (!mergeJars.isEmpty()) {
@@ -137,9 +134,7 @@ public final class MixedPipeline {
                 for (Path j : mergeJars) System.out.println("  " + j);
             }
 
-            JavaPipeline.compileClassesToDex(
-                    classFiles, out, androidJar, libs, minApi, keepDex, selfJar,
-                    mergeJars, baseApk, outApk);
+            JavaPipeline.compileClassesToDex(classFiles, out, ctx, baseApk, mergeJars);
 
         } finally {
             KotlinPipeline.deleteRecursive(work);

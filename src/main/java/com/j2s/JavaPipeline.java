@@ -6,32 +6,54 @@ import java.util.*;
 import java.util.stream.*;
 
 /**
- * Java compilation pipeline: javac → d8 → (multidex) → smali / APK.
+ * Java compilation pipeline: javac -&gt; d8 -&gt; (multidex) -&gt; smali / APK.
  */
 public class JavaPipeline {
 
-    public static void run(List<Path> inputFiles, Path out, Path androidJar,
-                           List<Path> libs, int minApi, boolean keepDex,
-                           String selfJar) throws Exception {
+    /** JVM tuning for javac. Passed via -J (javac-only flag). */
+    static final String[] JAVAC_JVM_OPTS = {
+            "-J-Xms256m",
+            "-J-Xmx1g",
+            "-J-XX:+UseParallelGC",
+    };
+
+    /** JVM tuning for the R8/D8 launcher. D8 benefits noticeably from a larger heap. */
+    static final String[] D8_JVM_OPTS = {
+            "-Xms512m",
+            "-Xmx2g",
+            "-XX:+UseParallelGC",
+    };
+
+    /** JVM tuning for the baksmali launcher. */
+    static final String[] BAKSMALI_JVM_OPTS = {
+            "-Xms256m",
+            "-Xmx1g",
+            "-XX:+UseParallelGC",
+    };
+
+    public static void run(List<Path> inputFiles, Path out, BuildContext ctx) throws Exception {
         Path tmp = Files.createTempDirectory("j2s_");
         System.out.println("Temp dir: " + tmp);
 
         try {
             List<String> javacArgs = new ArrayList<>();
             javacArgs.add("javac");
+
+            // JVM tuning: reduce startup latency and avoid tiny default heap.
+            javacArgs.addAll(Arrays.asList(JAVAC_JVM_OPTS));
+
             javacArgs.add("-d");
             javacArgs.add(tmp.toString());
-            if (androidJar != null || !libs.isEmpty()) {
-                String cp = "";
-                if (androidJar != null) cp = androidJar.toString();
-                if (!libs.isEmpty()) {
-                    if (!cp.isEmpty()) cp += File.pathSeparator;
-                    cp += libs.stream().map(Path::toString)
-                            .collect(Collectors.joining(File.pathSeparator));
-                }
+
+            List<String> cp = new ArrayList<>();
+            if (ctx.androidJar != null) cp.add(ctx.androidJar.toString());
+            for (Path lib : ctx.libs) cp.add(lib.toString());
+            for (Path dep : ctx.deps) cp.add(dep.toString());
+            if (!cp.isEmpty()) {
                 javacArgs.add("-cp");
-                javacArgs.add(cp);
+                javacArgs.add(String.join(File.pathSeparator, cp));
             }
+
             javacArgs.add("-source");
             javacArgs.add("1.8");
             javacArgs.add("-target");
@@ -46,7 +68,19 @@ public class JavaPipeline {
             if (classes.isEmpty()) Utils.error("No .class files generated");
             System.out.println("Compiled " + classes.size() + " classes");
 
-            compileClassesToDex(classes, out, androidJar, libs, minApi, keepDex, selfJar);
+            Path baseApk = null;
+            if (ctx.manifest != null && ctx.aapt2Exe != null) {
+                System.out.println("=== aapt2: resources + manifest ===");
+                Aapt2Builder.Result r = Aapt2Builder.process(
+                        ctx.androidJar, ctx.manifest, ctx.resDir,
+                        ctx.resources.resDirs(), ctx.resources.aarManifests(),
+                        ctx.resources.assetsDirs(), ctx.assetsDir,
+                        tmp, ctx.aapt2Exe, ctx.minApi, ctx.targetSdk, ctx.manifestMerge);
+                baseApk = r.baseApk;
+                classes.addAll(Aapt2Builder.compileRJava(r.genDir, ctx.androidJar, tmp));
+            }
+
+            compileClassesToDex(classes, out, ctx, baseApk, ctx.deps);
 
         } finally {
             Utils.delete(tmp);
@@ -54,64 +88,43 @@ public class JavaPipeline {
         }
     }
 
-    /** 旧签名：无 merge jars、无 APK。 */
-    public static void compileClassesToDex(List<Path> classes, Path out, Path androidJar,
-                                           List<Path> libs, int minApi, boolean keepDex,
-                                           String selfJar) throws Exception {
-        compileClassesToDex(classes, out, androidJar, libs, minApi, keepDex,
-                selfJar, Collections.<Path>emptyList(), null, null);
-    }
-
-    /** 中间签名：有 merge jars、无 APK。 */
-    public static void compileClassesToDex(List<Path> classes, Path out, Path androidJar,
-                                           List<Path> libs, int minApi, boolean keepDex,
-                                           String selfJar,
-                                           List<Path> mergeJars) throws Exception {
-        compileClassesToDex(classes, out, androidJar, libs, minApi, keepDex,
-                selfJar, mergeJars, null, null);
-    }
-
     /**
-     * 完整签名。支持 multidex 和 APK 打包。
+     * Full backend shared by the Java, Kotlin and mixed pipelines.
      *
-     * @param mergeJars  作为 d8 输入编进 dex 的 jar（kotlin-stdlib、maven deps）
-     * @param baseApk    aapt2 link 生成的 base.apk（含 resources.arsc + manifest）
-     * @param outApk     输出 APK 路径（baseApk 非 null 时必填）
+     * @param mergeJars jars fed into d8 as program input (resolved deps); they are dexed through
+     *                  {@link DexCache} and merged into the output dex
+     * @param baseApk   base.apk produced by aapt2 link (resources.arsc + manifest), or null
      */
-    public static void compileClassesToDex(List<Path> classes, Path out, Path androidJar,
-                                           List<Path> libs, int minApi, boolean keepDex,
-                                           String selfJar,
-                                           List<Path> mergeJars,
-                                           Path baseApk, Path outApk) throws Exception {
+    static void compileClassesToDex(List<Path> classes, Path out, BuildContext ctx,
+                                    Path baseApk, List<Path> mergeJars) throws Exception {
         if (classes.isEmpty()) Utils.error("No .class files to convert");
 
-        // 可缓存输入：stdlib + maven deps（多次构建之间内容不变）
-        List<Path> cacheable = (mergeJars == null) ? Collections.<Path>emptyList()
-                : mergeJars.stream()
-                        .filter(p -> p != null && Files.isRegularFile(p))
-                        .collect(Collectors.toList());
+        // Cacheable inputs: stdlib + resolved deps (content is stable across builds).
+        List<Path> cacheable = mergeJars.stream()
+                .filter(p -> p != null && Files.isRegularFile(p))
+                .collect(Collectors.toList());
 
         Path dexWork = Files.createTempDirectory("j2s_dex_");
         try {
             Path dexDir = dexWork.resolve("dex");
             Files.createDirectory(dexDir);
 
-            // ── 1. stdlib / deps：走 DexCache，命中则完全跳过 D8 ──
+            // ── 1. deps: go through DexCache, skip D8 entirely on hit ──
             List<Path> cacheableDex = Collections.emptyList();
             if (!cacheable.isEmpty()) {
                 Path cacheWork = dexWork.resolve("cache");
                 Files.createDirectory(cacheWork);
-                cacheableDex = DexCache.resolve(cacheable, minApi, androidJar, libs,
+                cacheableDex = DexCache.resolve(cacheable, ctx.minApi, ctx.androidJar, ctx.libs,
                         cacheWork,
-                        o -> runD8(cacheable, o, androidJar, libs, minApi, selfJar));
+                        o -> runD8(cacheable, o, ctx.androidJar, ctx.libs, ctx.minApi, ctx.selfJar));
             }
 
-            // ── 2. 业务 class + （缓存得到的）stdlib/deps dex ──
+            // ── 2. Business classes + (cached) deps dex ──
             List<Path> mainInputs = new ArrayList<>(classes);
             mainInputs.addAll(cacheableDex);
-            runD8(mainInputs, dexDir, androidJar, libs, minApi, selfJar);
+            runD8(mainInputs, dexDir, ctx.androidJar, ctx.libs, ctx.minApi, ctx.selfJar);
 
-            // 收集所有 dex（multidex）
+            // Collect all dex files (multidex).
             List<Path> dexFiles;
             try (Stream<Path> s = Files.list(dexDir)) {
                 dexFiles = s.filter(p -> p.getFileName().toString().matches("classes\\d*\\.dex"))
@@ -121,11 +134,11 @@ public class JavaPipeline {
             if (dexFiles.isEmpty()) Utils.error("d8 did not produce any dex");
             System.out.println("D8 produced " + dexFiles.size() + " dex file(s)");
 
-            if (baseApk != null && outApk != null) {
-                // APK 模式：把 dex 塞进 aapt2 生成的 base.apk
-                Aapt2Builder.packApk(baseApk, dexFiles, outApk);
-                System.out.println("APK output: " + outApk);
-            } else if (keepDex) {
+            if (baseApk != null && ctx.outApk != null) {
+                // APK mode: pack dex files (and AAR JNI libs) into the base.apk from aapt2.
+                Aapt2Builder.packApk(baseApk, dexFiles, ctx.outApk, ctx.resources.jniDirs());
+                System.out.println("APK output: " + ctx.outApk);
+            } else if (ctx.keepDex) {
                 Files.createDirectories(out);
                 for (Path d : dexFiles) {
                     Path target = out.resolve(d.getFileName().toString());
@@ -136,8 +149,12 @@ public class JavaPipeline {
                 Files.createDirectories(out);
                 List<String> args = new ArrayList<>();
                 args.add("java");
+
+                // JVM tuning for the baksmali launcher.
+                args.addAll(Arrays.asList(BAKSMALI_JVM_OPTS));
+
                 args.add("-cp");
-                args.add(selfJar);
+                args.add(ctx.selfJar);
                 args.add("com.android.tools.smali.baksmali.Main");
                 args.add("d");
                 for (Path d : dexFiles) args.add(d.toString());
@@ -157,15 +174,20 @@ public class JavaPipeline {
     }
 
     /**
-     * 调用 D8 把 inputs dex 化到 outDir，返回生成的 classes*.dex（multidex 时多个）。
+     * Run D8 to dex the inputs into outDir; returns the generated classes*.dex files
+     * (multiple when multidex).
      *
-     * @param selfJar J2S 自身 jar（R8 以子进程方式加载）
+     * @param selfJar J2S's own jar (R8 loaded as a child process)
      */
     static List<Path> runD8(List<Path> inputs, Path outDir, Path androidJar,
                             List<Path> libs, int minApi, String selfJar)
             throws Exception {
         List<String> d8cmd = new ArrayList<>();
         d8cmd.add("java");
+
+        // JVM tuning for the D8 launcher.
+        d8cmd.addAll(Arrays.asList(D8_JVM_OPTS));
+
         d8cmd.add("-cp");
         d8cmd.add(selfJar);
         d8cmd.add("com.android.tools.r8.D8");
